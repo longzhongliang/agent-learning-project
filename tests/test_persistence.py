@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from app.persistence import SessionRepository
+from app.persistence import SessionRepository, create_store
 
 
 class PersistenceTests(unittest.TestCase):
@@ -17,3 +17,16 @@ class PersistenceTests(unittest.TestCase):
                 self.assertEqual(sessions[0].title, "测试会话")
             finally:
                 repository.close()
+
+    def test_store_persists_long_term_memory_across_contexts(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "agent.db"
+
+            with create_store(database_path) as store:
+                store.put(("user_preferences",), "language", {"value": "zh-CN"})
+
+            with create_store(database_path) as store:
+                item = store.get(("user_preferences",), "language")
+
+            self.assertIsNotNone(item)
+            self.assertEqual(item.value, {"value": "zh-CN"})
