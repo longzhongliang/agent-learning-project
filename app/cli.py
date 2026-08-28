@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import uuid
+import sys
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langgraph.types import Command
 
-from app.agent import build_agent
+from app.agent import build_agent, build_chat_model
 from app.config import ConfigurationError, load_settings
 from app.persistence import SessionRepository, create_store
-from app.planning import build_auto_plan_graph
+from app.planning import build_auto_plan_graph, build_execution_plan
 
 
 def _generate_title(model: Any, first_message: str) -> str:
@@ -56,6 +57,55 @@ def _pending_tool_calls(agent: Any, config: dict[str, Any]) -> list[dict[str, An
         if isinstance(message, AIMessage) and message.tool_calls:
             return message.tool_calls
     return []
+
+
+def _recover_interrupted_tool_calls(agent: Any, config: dict[str, Any]) -> int:
+    """Turn incomplete tool-call history into a normal recovery note."""
+    state = agent.get_state(config)
+    messages = state.values.get("messages", [])
+    answered_tool_call_ids = {
+        message.tool_call_id for message in messages if isinstance(message, ToolMessage)
+    }
+
+    updates = []
+    recovered_count = 0
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+
+        tool_calls = message.tool_calls or []
+        interrupted_calls = [
+            tool_call for tool_call in tool_calls if tool_call["id"] not in answered_tool_call_ids
+        ]
+        if not interrupted_calls:
+            continue
+
+        related_tool_call_ids = {tool_call["id"] for tool_call in tool_calls}
+        updates.append(RemoveMessage(id=message.id))
+        for old_message in messages:
+            if (
+                isinstance(old_message, ToolMessage)
+                and old_message.tool_call_id in related_tool_call_ids
+            ):
+                updates.append(RemoveMessage(id=old_message.id))
+
+        tool_names = "、".join(tool_call["name"] for tool_call in interrupted_calls)
+        updates.append(
+            AIMessage(
+                content=(
+                    "系统恢复记录：上一次请求调用工具「"
+                    f"{tool_names}」时，终端被关闭或进程崩溃，"
+                    "因此结果未知。本次操作按未完成处理；"
+                    "后续如需继续，应先验证现状，并重新申请执行。"
+                )
+            )
+        )
+        recovered_count += len(interrupted_calls)
+
+    if updates:
+        agent.update_state(config, {"messages": updates})
+        print(f"[会话恢复] 已将 {recovered_count} 条中断工具调用标记为未完成。")
+    return recovered_count
 
 
 def _resume_approval_interrupts(agent: Any, config: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -116,10 +166,13 @@ def run_cli() -> None:
     repository = SessionRepository(settings.database_path)
     try:
         with create_store(settings.database_path) as store:
-            agent = build_agent(settings, repository.checkpointer, store)
-            auto_plan_graph = build_auto_plan_graph(agent)
+            model = build_chat_model(settings)
+            agent = build_agent(settings, repository.checkpointer, store, model=model)
+            auto_plan_graph = build_auto_plan_graph(model)
             thread_id, is_new, title = _choose_session(repository)
             config = {"configurable": {"thread_id": thread_id}}
+            trace_enabled = False
+            _recover_interrupted_tool_calls(agent, config)
 
             while True:
                 user_input = input("用户：").strip()
@@ -127,6 +180,18 @@ def run_cli() -> None:
                     print("退出对话。")
                     return
                 if not user_input:
+                    continue
+                if user_input == "/trace":
+                    status = "开启" if trace_enabled else "关闭"
+                    print(f"运行过程显示当前为：{status}")
+                    continue
+                if user_input == "/trace on":
+                    trace_enabled = True
+                    print("已开启运行过程显示。")
+                    continue
+                if user_input == "/trace off":
+                    trace_enabled = False
+                    print("已关闭运行过程显示。")
                     continue
 
                 # /plan <task>：用户强制计划模式
@@ -136,8 +201,7 @@ def run_cli() -> None:
                         print("用法：/plan 你的复杂任务")
                         continue
                     try:
-                        plan_result = auto_plan_graph.invoke({"task": task})
-                        plan = plan_result.get("execution_plan", "")
+                        plan = build_execution_plan(model, task)
                     except Exception as exc:
                         print(f"生成计划失败：{type(exc).__name__} - {exc}")
                         continue
@@ -154,7 +218,7 @@ def run_cli() -> None:
                     )
 
                 if is_new and title is None:
-                    title = _generate_title(agent, user_input)
+                    title = _generate_title(model, user_input)
                     repository.create_session(thread_id, title)
                     is_new = False
                     print(f"[新会话已创建] 标题：{title}")
@@ -165,14 +229,20 @@ def run_cli() -> None:
                 messages = result["messages"][before_count:]
                 final_message = result["messages"][-1]
                 print(f"模型：{final_message.content}")
-                _print_trace(messages)
+                if trace_enabled:
+                    _print_trace(messages)
     finally:
         repository.close()
 
 
 def main() -> None:
     try:
-        run_cli()
+        if "--ui" in sys.argv:
+            from app.ui import run_gradio_app
+
+            run_gradio_app()
+        else:
+            run_cli()
     except ConfigurationError as exc:
         print(f"配置错误：{exc}")
     except KeyboardInterrupt:

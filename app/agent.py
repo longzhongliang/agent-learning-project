@@ -9,8 +9,10 @@ from langchain_core.tools import tool
 from langchain_deepseek import ChatDeepSeek
 
 from app.config import Settings
+from app.mcp_tools import load_mcp_tools
 from app.planning import build_auto_plan_graph, create_planning_tool
 from app.rag import KnowledgeBase, build_rag_paths
+from app.tools.execution import RunPythonRetryGuardMiddleware
 from app.tools.execution import create_execution_tool
 from app.tools.filesystem import create_filesystem_tools
 from app.tools.preferences import load_user_preference, save_user_preference
@@ -45,9 +47,19 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
-def build_agent(settings: Settings, checkpointer: Any, store: Any):
+def build_chat_model(settings: Settings) -> ChatDeepSeek:
+    """Create the DeepSeek chat model from validated settings."""
+    return ChatDeepSeek(
+        model=settings.model_name,
+        temperature=0.4,
+        timeout=settings.model_timeout_seconds,
+        max_retries=settings.model_max_retries,
+    )
+
+
+def build_agent(settings: Settings, checkpointer: Any, store: Any, model: ChatDeepSeek | None = None):
     """Build the runnable Coding Agent from explicit dependencies."""
-    model = ChatDeepSeek(model=settings.model_name, temperature=0.4)
+    model = model or build_chat_model(settings)
 
     # RAG knowledge base (lazy: only loads when search_knowledge is first called)
     rag_paths = build_rag_paths(settings)
@@ -66,11 +78,13 @@ def build_agent(settings: Settings, checkpointer: Any, store: Any):
         get_weather,
         knowledge_tool,
         planning_tool,
+        *load_mcp_tools(settings.enable_mcp_tools),
     ]
     return create_agent(
         model=model,
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
+        middleware=[RunPythonRetryGuardMiddleware()],
         checkpointer=checkpointer,
         store=store,
     )

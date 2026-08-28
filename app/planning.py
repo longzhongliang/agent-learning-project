@@ -51,6 +51,17 @@ PLANNER_PROMPT = """
 """.strip()
 
 
+def build_execution_plan(model: ChatDeepSeek, task: str) -> str:
+    """Generate an execution plan directly with the planner prompt."""
+    response = model.invoke(
+        [
+            {"role": "system", "content": PLANNER_PROMPT},
+            {"role": "user", "content": f"请为下面任务制订执行计划：\n{task}"},
+        ]
+    )
+    return str(response.content)
+
+
 def build_auto_plan_graph(model: ChatDeepSeek):
     """Build the compiled auto-planning graph with the given model.
 
@@ -72,17 +83,8 @@ def build_auto_plan_graph(model: ChatDeepSeek):
         decision = decide_planning_mode(state["task"])
         return {"should_plan": decision.should_plan, "reason": decision.reason}
 
-    def build_execution_plan(task: str) -> str:
-        response = model.invoke(
-            [
-                {"role": "system", "content": PLANNER_PROMPT},
-                {"role": "user", "content": f"请为下面任务制订执行计划：\n{task}"},
-            ]
-        )
-        return str(response.content)
-
     def build_auto_plan_node(state: AutoPlanState):
-        execution_plan = build_execution_plan(state["task"])
+        execution_plan = build_execution_plan(model, state["task"])
         return {"execution_plan": execution_plan}
 
     def route_after_auto_plan_decision(state: AutoPlanState) -> str:
